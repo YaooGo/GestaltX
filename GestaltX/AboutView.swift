@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 huamidev
 import SwiftUI
-import UIKit
 
 struct AboutView: View {
     @EnvironmentObject private var model: GestaltManager
-    @State private var unlock = AdvancedUnlockSequence()
     var body: some View {
         List {
             Section {
@@ -48,7 +46,6 @@ struct AboutView: View {
         .listSectionSpacing(20)
         .safeAreaPadding(.bottom, 20)
         .navigationTitle(L("About"))
-        .onDisappear { unlock.reset() }
     }
 
     private var aboutFooter: some View {
@@ -56,13 +53,6 @@ struct AboutView: View {
         return VStack(spacing: 8) {
             Text("Version: \(GestaltBrand.version) (\(GestaltBrand.build))")
                 .foregroundStyle(.secondary)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    if unlock.tap() {
-                        model.unlockAdditionalOptions()
-                        UINotificationFeedbackGenerator().notificationOccurred(.success)
-                    }
-                }
             Text("Developed by huamidev")
                 .foregroundStyle(.secondary.opacity(0.7))
             Text("© \(String(year)) huamidev. All rights reserved.")

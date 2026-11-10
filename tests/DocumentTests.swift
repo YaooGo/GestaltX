@@ -51,7 +51,7 @@ final class AccessTrace: @unchecked Sendable {
         let uuid = "A4A4A4A4-1111-2222-3333-123456789ABC"
         let address: UInt64 = 0x180100000
         let keys = ["AAAAAAAAAAAAAAAAAAAAAA", DeviceCacheOptions.greenTeaKey,
-                    "BBBBBBBBBBBBBBBBBBBBBB", "CCCCCCCCCCCCCCCCCCCCCC",
+                    DeviceCacheOptions.wapiKey, "CCCCCCCCCCCCCCCCCCCCCC",
                     DeviceCacheOptions.notGreenTeaKey, "DDDDDDDDDDDDDDDDDDDDDD"]
         var strings = Data((uuid + "\0").utf8)
         var pointers: [UInt64] = []
@@ -86,6 +86,24 @@ final class AccessTrace: @unchecked Sendable {
         try expect(DeviceCacheOptions.flags(in: edited, using: layout) == .enabled, "Write the dynamically located target bytes")
         try edited.setCacheOptions(.restricted, using: layout)
         try expect(edited.matches(original), "Restore dynamic flags without changing other cache bytes or region fields")
+        try expect(layout.wapiIndex == 2, "Resolve WAPI independently from its descriptor")
+        var wapiCache = cache
+        wapiCache[16] = 1; wapiCache[50] = 1
+        var wapiRoot = original.root; wapiRoot["CacheData"] = wapiCache
+        let wapiDocument = try GestaltDocument(data: PropertyListSerialization.data(fromPropertyList: wapiRoot, format: .binary, options: 0))
+        var wapiEdited = wapiDocument
+        try wapiEdited.setWAPI(false, using: layout)
+        try DeviceCacheOptions.validateEdit(from: wapiDocument, to: wapiEdited, using: layout)
+        try expect(!DeviceCacheOptions.wapi(in: wapiEdited, using: layout), "Use relocated WAPI offsets")
+        var absentWAPI = descriptors
+        put(UInt64(0), into: &absentWAPI, at: 128)
+        let withoutWAPI = try MobileGestaltCacheLayout.scan(strings: strings, stringAddress: address, constants: [absentWAPI])
+        try expect(withoutWAPI.wapiIndex == nil, "Missing WAPI keeps green-tea available")
+        try expectThrows("Missing WAPI cannot be written") { try wapiEdited.setWAPI(false, using: withoutWAPI) }
+        var invalidWAPI = descriptors
+        put(UInt32(5), into: &invalidWAPI, at: 128 + 0x3C)
+        let nonBoolean = try MobileGestaltCacheLayout.scan(strings: strings, stringAddress: address, constants: [invalidWAPI])
+        try expect(nonBoolean.wapiIndex == nil, "Non-Boolean WAPI keeps green-tea available")
         var ambiguous = descriptors
         ambiguous.append(descriptors.subdata(in: 64..<128))
         put(Int16(3), into: &ambiguous, at: descriptors.count + 0x3A)
@@ -347,13 +365,14 @@ final class AccessTrace: @unchecked Sendable {
         defer { try? fm.removeItem(at: root) }
         try verifyDynamicCacheLayout()
         try await verifyCachedOptions(in: root)
+        try await verifyWAPI(in: root)
         let device = root.appendingPathComponent("device.plist")
         let backups = root.appendingPathComponent("backups", isDirectory: true)
         let original: [String: Any] = [
             "CacheExtra": ["VasUgeSzVyHdB27g2XpN0g": "fixture-device", GestaltKeys.productType: "iPhone17,1",
                            "integer": NSNumber(value: 1), "boolean": NSNumber(value: true),
                            "payload": Data([0, 1, 255]), "nested": ["array": [1, true, "text"]]],
-            "CacheData": Data([5, 10, 15]), "UnchangedTopLevel": "keep"
+            "CacheData": Data([5, 10, 15]), "CacheUUID": "fixture-layout", "CacheVersion": "fixture-version", "UnchangedTopLevel": "keep"
         ]
         let originalData = try PropertyListSerialization.data(fromPropertyList: original, format: .binary, options: 0)
         try await verifyPresetRestoration(data: originalData, directory: root.appendingPathComponent("absent-presets"))

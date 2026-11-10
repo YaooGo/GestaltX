@@ -2,6 +2,7 @@
 // Copyright (C) 2026 huamidev
 import Foundation
 import CoreFoundation
+import CryptoKit
 
 struct GestaltFailure: LocalizedError, Sendable {
     let key: String
@@ -31,7 +32,9 @@ enum PlistValueKind: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .string: return text
         case .integer:
-            guard let value = Int64(trimmed) else { throw GestaltFailure("Enter a valid whole number.") }
+            if let value = Int64(trimmed) { return NSNumber(value: value) }
+            // Binary plists can also contain unsigned 64-bit identifiers.
+            guard let value = UInt64(trimmed) else { throw GestaltFailure("Enter a valid whole number.") }
             return NSNumber(value: value)
         case .real:
             guard let value = Double(trimmed), value.isFinite else { throw GestaltFailure("Enter a finite decimal number.") }
@@ -66,7 +69,10 @@ enum PlistValueKind: String, CaseIterable, Identifiable, Sendable {
     func text(for value: Any) -> String {
         switch self {
         case .boolean: return (value as? NSNumber)?.boolValue == true ? "true" : "false"
-        case .date: return (value as? Date).map { ISO8601DateFormatter().string(from: $0) } ?? ""
+        case .date:
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            return (value as? Date).map { formatter.string(from: $0) } ?? ""
         case .data: return (value as? Data)?.base64EncodedString() ?? ""
         case .array, .dictionary:
             guard let data = try? PropertyListSerialization.data(fromPropertyList: value, format: .xml, options: 0),
@@ -94,6 +100,7 @@ struct GestaltDocument: @unchecked Sendable {
     private(set) var root: [String: Any]
     var extra: [String: Any] { root["CacheExtra"] as? [String: Any] ?? [:] }
     var artwork: [String: Any] { extra[GestaltKeys.artwork] as? [String: Any] ?? [:] }
+    var canEditArtwork: Bool { extra[GestaltKeys.artwork] == nil || extra[GestaltKeys.artwork] is [String: Any] }
 
     init(data: Data) throws {
         guard let root = try PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
@@ -112,6 +119,14 @@ struct GestaltDocument: @unchecked Sendable {
         var data = try DeviceCacheOptions.validatedData(in: self, using: layout)
         data[layout.greenTeaOffset] = flags.greenTea ? 1 : 0
         data[layout.notGreenTeaOffset] = flags.notGreenTea ? 1 : 0
+        root["CacheData"] = data
+    }
+
+    mutating func setWAPI(_ enabled: Bool, using resolvedLayout: MobileGestaltCacheLayout? = nil) throws {
+        let layout = try resolvedLayout ?? MobileGestaltCacheLayout.resolve(in: self)
+        _ = try DeviceCacheOptions.wapi(in: self, using: layout)
+        guard let offset = layout.wapiOffset, var data = root["CacheData"] as? Data else { return }
+        data[offset] = enabled ? 1 : 0
         root["CacheData"] = data
     }
 
@@ -143,11 +158,14 @@ struct GestaltDocument: @unchecked Sendable {
         applyRegion(code: code, salesSuffix: sales?.info)
     }
 
-    mutating func setArtwork(_ value: Any, for key: String) {
+    @discardableResult
+    mutating func setArtwork(_ value: Any, for key: String) -> Bool {
         // Never replace an existing malformed artwork value and silently lose its data.
+        guard canEditArtwork else { return false }
         var updated = artwork
         updated[key] = value
         set(updated, for: GestaltKeys.artwork)
+        return true
     }
 
     func encoded() throws -> Data {
@@ -165,7 +183,10 @@ struct GestaltDocument: @unchecked Sendable {
         case .array:
             guard let left = a as? [Any], let right = b as? [Any], left.count == right.count else { return false }
             return zip(left, right).allSatisfy { valuesEqual($0.0, $0.1) }
-        case .integer: return (a as? NSNumber)?.int64Value == (b as? NSNumber)?.int64Value
+        case .integer:
+            // int64Value wraps unsigned values above Int64.max (for example,
+            // UInt64.max becomes -1), hiding edits and readback corruption.
+            return (a as? NSNumber)?.stringValue == (b as? NSNumber)?.stringValue
         case .real: return (a as? NSNumber)?.doubleValue == (b as? NSNumber)?.doubleValue
         case .boolean: return (a as? NSNumber)?.boolValue == (b as? NSNumber)?.boolValue
         case .data: return (a as? Data) == (b as? Data)
@@ -202,7 +223,13 @@ struct DocumentSnapshot: @unchecked Sendable {
     let name: String
     var originals: [String: OriginalField] = [:]
     var cachedOptionsOriginal: CachedOptionsOriginal?
+    var wapiOriginal: WAPIOriginal?
     var ownershipVerified = false
+
+    func originalWAPI() throws -> Bool {
+        if let wapiOriginal { return try wapiOriginal.value(in: document) }
+        return try DeviceCacheOptions.wapi(in: document)
+    }
 
     func originalCachedOptionFlags() throws -> CachedOptionFlags {
         if let cachedOptionsOriginal { return try cachedOptionsOriginal.flags(in: document) }
@@ -216,7 +243,10 @@ struct DocumentSnapshot: @unchecked Sendable {
            let after = try? DeviceCacheOptions.flags(in: edited), before.flags != after {
             audio = before
         }
-        return OriginalValues(fields: recordingChanges(to: edited), cachedOptions: audio)
+        var wapi = wapiOriginal
+        if wapi == nil, let before = try? WAPIOriginal(document: document),
+           let after = try? DeviceCacheOptions.wapi(in: edited), before.enabled != after { wapi = before }
+        return OriginalValues(fields: recordingChanges(to: edited), cachedOptions: audio, wapi: wapi)
     }
 
     func originalValue(for key: String) -> Any? {
@@ -255,6 +285,7 @@ struct DocumentSnapshot: @unchecked Sendable {
 struct OriginalValues {
     var fields: [String: OriginalField] = [:]
     var cachedOptions: CachedOptionsOriginal?
+    var wapi: WAPIOriginal?
 }
 
 struct BackupRecord: Identifiable, Codable, Sendable {
@@ -264,7 +295,13 @@ struct BackupRecord: Identifiable, Codable, Sendable {
     let source: DocumentSource
     let deviceID: String
     let byteCount: Int
+    let sha256: String?
     var filename: String { id.uuidString + ".plist" }
+
+    init(id: UUID, date: Date, reason: String, source: DocumentSource, deviceID: String, byteCount: Int, sha256: String? = nil) {
+        self.id = id; self.date = date; self.reason = reason; self.source = source
+        self.deviceID = deviceID; self.byteCount = byteCount; self.sha256 = sha256
+    }
 }
 
 actor GestaltFileStore {
@@ -306,12 +343,13 @@ actor GestaltFileStore {
                 if let audio = originals.cachedOptions, let flags = try? audio.flags(in: baseline) {
                     try baseline.setCacheOptions(flags)
                 }
-                let hasOriginals = !originals.fields.isEmpty || originals.cachedOptions != nil
+                if let wapi = originals.wapi, let value = try? wapi.value(in: baseline) { try baseline.setWAPI(value) }
+                let hasOriginals = !originals.fields.isEmpty || originals.cachedOptions != nil || originals.wapi != nil
                 let initialData = hasOriginals ? try baseline.encoded() : data
                 try saveBackup(initialData, source: .device, reason: hasOriginals ? "Original values snapshot" : "Initial backup")
             }
             return DocumentSnapshot(data: data, document: document, source: .device, name: "MobileGestalt",
-                                    originals: originals.fields, cachedOptionsOriginal: originals.cachedOptions)
+                                    originals: originals.fields, cachedOptionsOriginal: originals.cachedOptions, wapiOriginal: originals.wapi)
         }
     }
 
@@ -343,7 +381,7 @@ actor GestaltFileStore {
     private func loadOriginals(for document: GestaltDocument) throws -> OriginalValues {
         guard FileManager.default.fileExists(atPath: originalsURL.path) else {
             let recovered = try recoverOriginals(from: document)
-            if !recovered.fields.isEmpty || recovered.cachedOptions != nil {
+            if !recovered.fields.isEmpty || recovered.cachedOptions != nil || recovered.wapi != nil {
                 try saveOriginals(recovered, for: document)
             }
             return recovered
@@ -378,8 +416,18 @@ actor GestaltFileStore {
         // without replacing their already-recorded CacheExtra originals.
         let recoveredAudio = audio == nil ? try recoverOriginals(from: document).cachedOptions : nil
         if let recoveredAudio { audio = recoveredAudio }
-        let state = OriginalValues(fields: originals, cachedOptions: audio)
-        if recoveredAudio != nil { try saveOriginals(state, for: document) }
+        var wapi: WAPIOriginal?
+        if let entry = plist["wapi"] {
+            guard let bytes = entry as? Data,
+                  let decoded = try? PropertyListDecoder().decode(WAPIOriginal.self, from: bytes) else {
+                throw GestaltFailure("Original values could not be read. No system changes were made.")
+            }
+            wapi = decoded
+        }
+        let recoveredWAPI = wapi == nil ? try recoverOriginals(from: document).wapi : nil
+        if let recoveredWAPI { wapi = recoveredWAPI }
+        let state = OriginalValues(fields: originals, cachedOptions: audio, wapi: wapi)
+        if recoveredAudio != nil || recoveredWAPI != nil { try saveOriginals(state, for: document) }
         return state
     }
 
@@ -396,17 +444,17 @@ actor GestaltFileStore {
             guard document.matchesIdentity(current) else { continue }
             if let previous {
                 originals = DocumentSnapshot(data: Data(), document: previous, source: .device, name: "",
-                                             originals: originals.fields, cachedOptionsOriginal: originals.cachedOptions)
+                                             originals: originals.fields, cachedOptionsOriginal: originals.cachedOptions, wapiOriginal: originals.wapi)
                     .recordingOriginals(to: document)
             }
             previous = document
         }
         if let previous {
             originals = DocumentSnapshot(data: Data(), document: previous, source: .device, name: "",
-                                         originals: originals.fields, cachedOptionsOriginal: originals.cachedOptions)
+                                         originals: originals.fields, cachedOptionsOriginal: originals.cachedOptions, wapiOriginal: originals.wapi)
                 .recordingOriginals(to: current)
         }
-        if !originals.fields.isEmpty || originals.cachedOptions != nil {
+        if !originals.fields.isEmpty || originals.cachedOptions != nil || originals.wapi != nil {
             eventSink("Original values: recovered from device backups")
         }
         return originals
@@ -417,6 +465,7 @@ actor GestaltFileStore {
                                    "values": originals.fields.mapValues(\.plist)]
         do {
             if let audio = originals.cachedOptions { plist["faceTimeAudio"] = try PropertyListEncoder().encode(audio) }
+            if let wapi = originals.wapi { plist["wapi"] = try PropertyListEncoder().encode(wapi) }
             let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .binary, options: 0)
             try data.write(to: originalsURL, options: .atomic)
             guard try Data(contentsOf: originalsURL) == data else {
@@ -432,7 +481,8 @@ actor GestaltFileStore {
     private func saveBackup(_ data: Data, source: DocumentSource, reason: String) throws -> BackupRecord {
         _ = try GestaltDocument(data: data)
         try FileManager.default.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
-        let record = BackupRecord(id: UUID(), date: Date(), reason: reason, source: source, deviceID: deviceID, byteCount: data.count)
+        let record = BackupRecord(id: UUID(), date: Date(), reason: reason, source: source, deviceID: deviceID,
+                                  byteCount: data.count, sha256: backupDigest(data))
         let url = backupDirectory.appendingPathComponent(record.filename)
         try data.write(to: url, options: .atomic)
         // A failed backup must stop a write. Verify the backup before creating its metadata.
@@ -450,8 +500,18 @@ actor GestaltFileStore {
 
     func backupData(_ record: BackupRecord) throws -> Data {
         let data = try Data(contentsOf: backupDirectory.appendingPathComponent(record.filename))
+        // Older metadata has no digest, but its recorded size is still checked.
+        // New backups also detect replacement by another same-size valid plist.
+        guard data.count == record.byteCount,
+              record.sha256.map({ $0 == backupDigest(data) }) ?? true else {
+            throw GestaltFailure("The backup could not be verified. No system write was started.")
+        }
         _ = try GestaltDocument(data: data)
         return data
+    }
+
+    private func backupDigest(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     func deleteBackup(_ record: BackupRecord) throws {
@@ -459,17 +519,26 @@ actor GestaltFileStore {
         try FileManager.default.removeItem(at: backupDirectory.appendingPathComponent(record.filename))
     }
 
+    private func validateRestoreLayout(_ document: GestaltDocument, against current: GestaltDocument) throws {
+        let failure = GestaltFailure("This plist uses a different system cache layout and cannot be restored.")
+        guard let uuid = document.root["CacheUUID"] as? String, !uuid.isEmpty,
+              current.root["CacheUUID"] as? String == uuid,
+              let data = document.root["CacheData"] as? Data,
+              let currentData = current.root["CacheData"] as? Data, data.count == currentData.count else {
+            throw failure
+        }
+        switch (document.root["CacheVersion"], current.root["CacheVersion"]) {
+        case (nil, nil): break
+        case (let saved?, let live?) where GestaltDocument.valuesEqual(saved, live): break
+        default: throw failure
+        }
+    }
+
     func restoreVerifiedImport(_ imported: DocumentSnapshot, expected: DocumentSnapshot) throws -> DocumentSnapshot {
         guard imported.source == .local, imported.ownershipVerified, expected.source == .device else {
             throw GestaltFailure("This plist's device proof could not be verified on this device.")
         }
-        guard let uuid = imported.document.root["CacheUUID"] as? String, !uuid.isEmpty,
-              expected.document.root["CacheUUID"] as? String == uuid,
-              imported.document.root["CacheVersion"] as? String == expected.document.root["CacheVersion"] as? String,
-              let data = imported.document.root["CacheData"] as? Data,
-              let current = expected.document.root["CacheData"] as? Data, data.count == current.count else {
-            throw GestaltFailure("This plist uses a different system cache layout and cannot be restored.")
-        }
+        try validateRestoreLayout(imported.document, against: expected.document)
         let record = try saveBackup(imported.data, source: .device, reason: "Verified import")
         return try commit(imported.document, expected: expected, restoring: record)
     }
@@ -486,12 +555,15 @@ actor GestaltFileStore {
             var originals = expected.recordingOriginals(to: edited)
             for key in originallyAbsentKeys { originals.fields[key] = OriginalField(value: nil) }
             return DocumentSnapshot(data: output, document: edited, source: .local, name: expected.name,
-                                    originals: originals.fields, cachedOptionsOriginal: originals.cachedOptions, ownershipVerified: expected.ownershipVerified)
+                                    originals: originals.fields, cachedOptionsOriginal: originals.cachedOptions, wapiOriginal: originals.wapi, ownershipVerified: expected.ownershipVerified)
         }
         if let record {
             guard record.source == .device, record.deviceID == deviceID, edited.matchesIdentity(expected.document) else {
                 throw GestaltFailure("This backup does not belong to this device. Open it as a local file instead.")
             }
+            // Device ownership alone does not make an older OS cache compatible.
+            // Apply the same layout checks to saved backups and verified imports.
+            try validateRestoreLayout(edited, against: expected.document)
         }
         return try withAccess {
             let current = try Data(contentsOf: deviceURL)
@@ -501,6 +573,7 @@ actor GestaltFileStore {
             let saved = try loadOriginals(for: expected.document)
             baseline.originals.merge(saved.fields) { _, saved in saved }
             if let audio = saved.cachedOptions { baseline.cachedOptionsOriginal = audio }
+            if let wapi = saved.wapi { baseline.wapiOriginal = wapi }
             var originals = baseline.recordingOriginals(to: edited)
             // Explicitly removing a user-confirmed added field also corrects
             // old zero/one residues whose earlier origin was not recorded.
@@ -518,7 +591,7 @@ actor GestaltFileStore {
                 let readback = try Data(contentsOf: deviceURL)
                 guard try edited.matches(GestaltDocument(data: readback)) else { throw GestaltFailure("The write did not match the readback.") }
                 eventSink("Readback: verified")
-                return DocumentSnapshot(data: readback, document: edited, source: .device, name: expected.name, originals: originals.fields, cachedOptionsOriginal: originals.cachedOptions)
+                return DocumentSnapshot(data: readback, document: edited, source: .device, name: expected.name, originals: originals.fields, cachedOptionsOriginal: originals.cachedOptions, wapiOriginal: originals.wapi)
             } catch {
                 eventSink("Write/readback failed: " + error.localizedDescription)
                 eventSink("Recovery: restoring previous bytes")

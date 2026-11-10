@@ -6,6 +6,9 @@ struct MobileGestaltCacheLayout: Codable, Equatable, Sendable {
     let slotCount: Int
     let greenTeaIndex: Int
     let notGreenTeaIndex: Int
+    var wapiIndex: Int? = nil
+
+    var wapiOffset: Int? { wapiIndex.map { $0 * 8 } }
 
     var byteCount: Int { slotCount * 9 }
     var greenTeaOffset: Int { greenTeaIndex * 8 }
@@ -15,7 +18,7 @@ struct MobileGestaltCacheLayout: Codable, Equatable, Sendable {
     // Retain offline editing of the previously verified layout. Other layouts
     // are resolved from the device's own library, never selected by model/OS.
     static let originalProfile = Self(uuid: "7F1DF278-18B7-4E5A-8425-09E8830DE9AF",
-                                      slotCount: 720, greenTeaIndex: 383, notGreenTeaIndex: 506)
+                                      slotCount: 720, greenTeaIndex: 383, notGreenTeaIndex: 506, wapiIndex: 694)
     private static let runtimeProfile: Self? = {
         #if os(iOS) && !targetEnvironment(simulator)
         guard let image = GXCopyMobileGestaltImage() else { return nil }
@@ -30,6 +33,7 @@ struct MobileGestaltCacheLayout: Codable, Equatable, Sendable {
               (0..<slotCount).contains(notGreenTeaIndex), greenTeaIndex != notGreenTeaIndex,
               let uuid = document.root["CacheUUID"] as? String,
               let data = document.root["CacheData"] as? Data else { return false }
+        if let wapiIndex, (!(0..<slotCount).contains(wapiIndex) || wapiIndex == greenTeaIndex || wapiIndex == notGreenTeaIndex) { return false }
         return self.uuid.caseInsensitiveCompare(uuid) == .orderedSame && data.count == byteCount
     }
 
@@ -76,6 +80,9 @@ struct MobileGestaltCacheLayout: Codable, Equatable, Sendable {
         guard uuids.count == 1, let uuid = uuids.first else { throw failure }
         var indices = Set<Int>()
         var targets: [String: Set<Int>] = [:]
+        var wapiIndices = Set<Int>()
+        var wapiLocations = Set<String>()
+        var invalidWAPI = false
         var targetLocations: [String: Set<String>] = [:]
         for (sectionID, section) in constants.enumerated() where section.count >= 64 {
             try section.withUnsafeBytes { raw in
@@ -86,6 +93,12 @@ struct MobileGestaltCacheLayout: Codable, Equatable, Sendable {
                     guard let key = hashes[pointer] else { continue }
                     let index = Int(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: offset + 0x3A, as: Int16.self)))
                     let type = UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: offset + 0x3C, as: UInt32.self))
+                    if key == DeviceCacheOptions.wapiKey {
+                        if type == 11 && index >= 0 && index < 16384 {
+                            wapiIndices.insert(index)
+                            wapiLocations.insert("\(sectionID):\(offset % 64)")
+                        } else { invalidWAPI = true }
+                    }
                     guard (-1..<16384).contains(index), (1...11).contains(type) else { continue }
                     if index >= 0 { indices.insert(index) }
                     if key == DeviceCacheOptions.greenTeaKey || key == DeviceCacheOptions.notGreenTeaKey {
@@ -103,6 +116,9 @@ struct MobileGestaltCacheLayout: Codable, Equatable, Sendable {
               let greenIndex = green.first, let notGreenIndex = notGreen.first, greenIndex != notGreenIndex,
               let greenLocation = targetLocations[DeviceCacheOptions.greenTeaKey], greenLocation.count == 1,
               greenLocation == targetLocations[DeviceCacheOptions.notGreenTeaKey] else { throw failure }
-        return Self(uuid: uuid, slotCount: maximum + 1, greenTeaIndex: greenIndex, notGreenTeaIndex: notGreenIndex)
+        let wapi = !invalidWAPI && wapiIndices.count == 1 && !wapiIndices.contains(greenIndex) && !wapiIndices.contains(notGreenIndex) && wapiLocations == greenLocation
+            ? wapiIndices.first : nil
+        return Self(uuid: uuid, slotCount: maximum + 1, greenTeaIndex: greenIndex,
+                    notGreenTeaIndex: notGreenIndex, wapiIndex: wapi)
     }
 }

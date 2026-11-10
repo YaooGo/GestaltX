@@ -54,6 +54,7 @@ struct CachedBooleanChange: Identifiable {
 }
 
 enum DeviceCacheOptions {
+    static let wapiKey = "hiHut/WR+B9Lx/vd0WyeNg"
     static let greenTeaKey = "iyfxmLogGVIaH7aEgqwcIA"
     static let notGreenTeaKey = "4snMZS8LJkSctKypt2m+xA"
 
@@ -82,10 +83,14 @@ enum DeviceCacheOptions {
         guard let before = original.root["CacheData"] as? Data,
               let after = edited.root["CacheData"] as? Data,
               before != after,
-              (try? validatedData(in: original)) != nil,
               let layout = try? MobileGestaltCacheLayout.resolve(in: original),
               after.count == before.count else { return [] }
-        return [("green-tea", layout.greenTeaOffset), ("not-green-tea", layout.notGreenTeaOffset)].compactMap { name, offset in
+        var fields: [(String, Int)] = []
+        if (try? validatedData(in: original)) != nil {
+            fields += [("green-tea", layout.greenTeaOffset), ("not-green-tea", layout.notGreenTeaOffset)]
+        }
+        if let offset = layout.wapiOffset, (try? wapi(in: original)) != nil { fields.append(("wapi", offset)) }
+        return fields.compactMap { name, offset in
             guard before[offset] != after[offset] else { return nil }
             return CachedBooleanChange(name: name, offset: offset, before: before[offset] != 0, after: after[offset] != 0)
         }
@@ -95,12 +100,64 @@ enum DeviceCacheOptions {
                              using resolvedLayout: MobileGestaltCacheLayout? = nil) throws {
         guard original.root["CacheData"] as? Data != edited.root["CacheData"] as? Data else { return }
         let layout = try resolvedLayout ?? MobileGestaltCacheLayout.resolve(in: original)
-        let before = try validatedData(in: original, using: layout)
-        let after = try validatedData(in: edited, using: layout)
-        guard before.indices.allSatisfy({ index in
-            index == layout.greenTeaOffset || index == layout.notGreenTeaOffset || before[index] == after[index]
-        }) else {
+        guard layout.matches(original), layout.matches(edited),
+              let before = original.root["CacheData"] as? Data,
+              let after = edited.root["CacheData"] as? Data else {
+            throw GestaltFailure("The cache layout or values do not match this preset.")
+        }
+        let changed = Set(before.indices.filter { before[$0] != after[$0] })
+        var allowed: Set<Int> = [layout.greenTeaOffset, layout.notGreenTeaOffset]
+        if let offset = layout.wapiOffset { allowed.insert(offset) }
+        guard changed.isSubset(of: allowed) else {
             throw GestaltFailure("This preset changes unrelated cache bytes.")
         }
+        if !changed.isDisjoint(with: [layout.greenTeaOffset, layout.notGreenTeaOffset]) {
+            _ = try validatedData(in: original, using: layout)
+            _ = try validatedData(in: edited, using: layout)
+        }
+        if let offset = layout.wapiOffset, changed.contains(offset) {
+            _ = try wapi(in: original, using: layout)
+            _ = try wapi(in: edited, using: layout)
+        }
+    }
+
+    static func wapi(in document: GestaltDocument, using resolvedLayout: MobileGestaltCacheLayout? = nil) throws -> Bool {
+        let layout = try resolvedLayout ?? MobileGestaltCacheLayout.resolve(in: document)
+        guard layout.matches(document), let index = layout.wapiIndex, let offset = layout.wapiOffset,
+              let data = document.root["CacheData"] as? Data,
+              data[layout.validityOffset(for: index)] == 1, data[offset] <= 1,
+              data[(offset + 1)..<(offset + 8)].allSatisfy({ $0 == 0 }),
+              document.extra[wapiKey] == nil, document.extra["wapi"] == nil else {
+            throw GestaltFailure("The cache layout or values do not match this preset.")
+        }
+        return data[offset] == 1
+    }
+}
+
+enum WAPIChoice: Int, CaseIterable, Identifiable {
+    case keep, disable, restoreOriginal
+    var id: Int { rawValue }
+    var title: LocalizedStringResource {
+        switch self {
+        case .keep: "Keep Current"
+        case .disable: "Disable WAPI"
+        case .restoreOriginal: "Restore Original"
+        }
+    }
+}
+
+struct WAPIOriginal: Codable, Equatable, Sendable {
+    let layoutUUID: String
+    let enabled: Bool
+    init(document: GestaltDocument) throws {
+        enabled = try DeviceCacheOptions.wapi(in: document)
+        layoutUUID = document.root["CacheUUID"] as? String ?? ""
+    }
+    func value(in document: GestaltDocument) throws -> Bool {
+        _ = try DeviceCacheOptions.wapi(in: document)
+        guard document.root["CacheUUID"] as? String == layoutUUID else {
+            throw GestaltFailure("The cache layout or values do not match this preset.")
+        }
+        return enabled
     }
 }
